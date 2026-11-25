@@ -1,0 +1,83 @@
+name: AWS Deploy
+on:
+  push
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Install dependencies
+        run: npm install
+      - name: Lint
+        id : lint-step
+        #continue-on-error: true
+        run: npm run lint
+      - name: check-lint
+        if: failure() && steps.lint-step.outcome == 'failure'
+        run: echo "Codigo precisa ser revisto!!"
+  build_docker:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Login to DockerHub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v2
+        with:
+          context: ./
+          push: true
+          dockerfile: ./Dockerfile   # Specify the path to your Dockerfile here
+          tags: lucasrrafael/webacademy-lab04:latest
+  # Deploy em produção na AWS: só roda depois que a imagem nova foi publicada no Docker Hub
+  deploy:
+    needs: build_docker
+    name: Deploy AWS EC2
+    runs-on: ubuntu-latest
+    environment: aws_deploy
+    permissions:
+      id-token: write   # OIDC: o GitHub troca um token temporário pela role da AWS (nenhuma chave da AWS fica guardada)
+      contents: read
+    env:
+      AWS_REGION: us-east-1
+      IMAGE: lucasrrafael/webacademy-lab04:latest
+    steps:
+      # Login na AWS assumindo a role lab04-github-deploy-role
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Estratégia de deploy: na EC2, baixa a imagem nova e recria o container (via AWS Systems Manager, sem SSH)
+      - name: Deploy Docker image
+        env:
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy webacademy-lab04 ${GITHUB_SHA::7}" \
+            --parameters "commands=[\"docker pull $IMAGE\",\"docker rm -f webacademy || true\",\"docker run -d --name webacademy --restart always -p 8080:8080 $IMAGE\",\"docker ps --filter name=webacademy\"]" \
+            --query Command.CommandId --output text)
+          echo "Comando SSM: $CMD_ID"
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$INSTANCE_ID"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text
+
+      # Verifica se a aplicação publicada responde
+      - name: Check deployed app
+        env:
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "Aplicação: http://$IP:8080"
+          curl -s --retry 10 --retry-all-errors --retry-delay 3 "http://$IP:8080/"
